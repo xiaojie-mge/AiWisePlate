@@ -376,7 +376,12 @@ def _validate_api_auth(
     query_api_key: Optional[str] = None,
     allow_query: bool = False,
 ) -> None:
-    """Validate configured auth, preserving loopback-only dev mode."""
+    """Validate configured auth, preserving loopback-only dev mode.
+
+    Accepts either:
+    - The configured API_AUTH_KEY (vibe2026)
+    - A valid stock system JWT token (vt_token from login page)
+    """
     api_key = _configured_api_key()
     if not api_key:
         if _is_local_client(request):
@@ -387,8 +392,22 @@ def _validate_api_auth(
         )
 
     token = _auth_credential_from_header_or_query(cred, query_api_key, allow_query=allow_query)
-    if not token or not hmac.compare_digest(token, api_key):
+    if not token:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+    # Accept API_AUTH_KEY
+    if hmac.compare_digest(token, api_key):
+        return
+
+    # Also accept a valid stock system JWT (so stock-login users can use the AI agent)
+    try:
+        from src.stock.user_db import verify_token as _vt
+        if _vt(token):
+            return
+    except Exception:
+        pass
+
+    raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 def _is_local_client(request: Request) -> bool:
@@ -1710,6 +1729,689 @@ async def cancel_swarm_run(run_id: str):
 
 
 # ============================================================================
+# Stock Monitoring Routes (/login  /stock  /api/stock/*)
+# ============================================================================
+
+from src.stock.user_db import (
+    init_db as _stock_init_db,
+    verify_login as _stock_verify_login,
+    create_token as _stock_create_token,
+    verify_token as _stock_verify_token,
+    create_user as _stock_create_user,
+    list_users as _stock_list_users,
+    delete_user as _stock_delete_user,
+)
+
+_stock_init_db()
+
+# 启动股票监控定时任务
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler  # noqa: F401
+    from src.stock.services.scheduler import start_scheduler, stop_scheduler
+
+    @app.on_event("startup")
+    async def _start_stock_scheduler():
+        start_scheduler()
+
+    @app.on_event("shutdown")
+    async def _stop_stock_scheduler():
+        stop_scheduler()
+except ImportError:
+    console.print("[yellow]APScheduler 未安装，定时监控不可用。运行: pip install apscheduler[/yellow]")
+
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# 挂载 static 目录（echarts.min.js 等静态资源）
+from fastapi.staticfiles import StaticFiles as _StaticFiles
+app.mount("/static", _StaticFiles(directory=str(_STATIC_DIR)), name="static_files")
+
+
+def _stock_current_user(request: Request) -> dict:
+    """Extract current user from Bearer token (stock auth)."""
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else ""
+    user = _stock_verify_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="请先登录")
+    return user
+
+
+def _require_admin(request: Request) -> dict:
+    user = _stock_current_user(request)
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+    return user
+
+
+# ── Static pages ─────────────────────────────────────────────────────────────
+
+@app.get("/login")
+async def login_page():
+    p = _STATIC_DIR / "login.html"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="login.html not found")
+    return FileResponse(p, media_type="text/html")
+
+
+@app.get("/stock")
+async def stock_page():
+    p = _STATIC_DIR / "stock.html"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="stock.html not found")
+    return FileResponse(p, media_type="text/html")
+
+
+# ── Auth endpoints ────────────────────────────────────────────────────────────
+
+class StockLoginBody(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/stock/auth/login")
+async def stock_login(body: StockLoginBody):
+    user = _stock_verify_login(body.username, body.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="账号或密码错误")
+    token = _stock_create_token(user)
+    return {"token": token, "username": user["username"],
+            "role": user["role"], "display": user["display"] or user["username"]}
+
+
+@app.get("/api/stock/auth/me")
+async def stock_me(request: Request):
+    user = _stock_current_user(request)
+    return {"uid": user["uid"], "username": user["u"],
+            "role": user["role"]}
+
+
+# ── User management (admin) ───────────────────────────────────────────────────
+
+class CreateUserBody(BaseModel):
+    username: str
+    password: str
+    display: str = ""
+    role: str = "user"
+
+
+@app.get("/api/stock/admin/users")
+async def stock_list_users(request: Request):
+    _require_admin(request)
+    return _stock_list_users()
+
+
+@app.post("/api/stock/admin/users")
+async def stock_create_user(body: CreateUserBody, request: Request):
+    _require_admin(request)
+    try:
+        return _stock_create_user(body.username, body.password, body.role, body.display)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/stock/admin/users/{username}")
+async def stock_delete_user(username: str, request: Request):
+    _require_admin(request)
+    ok = _stock_delete_user(username)
+    if not ok:
+        raise HTTPException(status_code=403, detail="用户不存在或 admin 账户不可删除")
+    return {"status": "deleted"}
+
+
+class UpdatePermBody(BaseModel):
+    role: Optional[str] = None
+    can_ai: Optional[int] = None
+    can_backtest: Optional[int] = None
+    can_stock: Optional[int] = None
+    is_active: Optional[int] = None
+    display: Optional[str] = None
+
+
+@app.put("/api/stock/admin/users/{username}/permissions")
+async def stock_update_permissions(username: str, body: UpdatePermBody, request: Request):
+    """更新用户权限。"""
+    _require_admin(request)
+    from src.stock.user_db import update_user_permissions
+    perms = {k: v for k, v in body.model_dump().items() if v is not None}
+    ok = update_user_permissions(username, perms)
+    if not ok:
+        raise HTTPException(status_code=400, detail="更新失败")
+    return {"status": "ok"}
+
+
+@app.post("/api/stock/admin/users/{username}/reset-password")
+async def stock_reset_password(username: str, request: Request):
+    """重置用户密码。"""
+    _require_admin(request)
+    body = await request.json()
+    new_pwd = body.get("password", "").strip()
+    if len(new_pwd) < 6:
+        raise HTTPException(status_code=400, detail="密码至少6位")
+    from src.stock.user_db import change_password
+    ok = change_password(username, new_pwd)
+    if not ok:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return {"status": "ok"}
+
+
+# ── Stock data endpoints (stub — filled in Step 2) ───────────────────────────
+
+@app.get("/api/stock/pool")
+async def stock_get_pool(request: Request):
+    user = _stock_current_user(request)
+    from src.stock.stock_db import get_pool
+    return get_pool(user["uid"])
+
+
+class AddPoolBody(BaseModel):
+    code: str
+
+@app.post("/api/stock/pool/add")
+async def stock_add_pool(body: AddPoolBody, request: Request):
+    user = _stock_current_user(request)
+    import akshare as ak
+    code = body.code.strip().upper()
+    # Lookup name
+    name = ""
+    try:
+        symbol = code.split(".")[0]
+        df = ak.stock_info_a_code_name()
+        row = df[df["code"] == symbol]
+        if not row.empty:
+            name = row.iloc[0]["name"]
+    except Exception:
+        pass
+    from src.stock.stock_db import add_to_pool
+    add_to_pool(user["uid"], code, name)
+    return {"status": "ok", "code": code, "name": name}
+
+
+@app.post("/api/stock/pool/remove")
+async def stock_remove_pool(request: Request, code: str = Query(...)):
+    """从策略池移除股票（用 query param 避免 dot 路由问题）。"""
+    user = _stock_current_user(request)
+    from src.stock.stock_db import _conn
+    conn = _conn()
+    conn.execute(
+        "UPDATE stock_pool SET status='out' WHERE user_id=? AND code=?",
+        (user["uid"], code.upper())
+    )
+    conn.commit()
+    return {"status": "ok"}
+
+
+@app.get("/api/stock/candidates")
+async def stock_get_candidates(request: Request):
+    user = _stock_current_user(request)
+    from src.stock.stock_db import get_candidates
+    return get_candidates(user["uid"])
+
+
+@app.post("/api/stock/candidates/{cid}/select")
+async def stock_select_candidate(cid: int, request: Request):
+    user = _stock_current_user(request)
+    from src.stock.stock_db import select_candidate
+    select_candidate(cid, user["uid"])
+    return {"status": "ok"}
+
+
+@app.get("/api/stock/signals")
+async def stock_get_signals(request: Request):
+    user = _stock_current_user(request)
+    from src.stock.stock_db import get_signals
+    return get_signals(user["uid"])
+
+
+@app.get("/api/stock/positions")
+async def stock_get_positions(request: Request):
+    user = _stock_current_user(request)
+    from src.stock.stock_db import get_positions
+    return get_positions(user["uid"])
+
+
+@app.get("/api/stock/chart/{code}")
+async def stock_chart(code: str, days: int = Query(60, ge=10, le=250)):
+    """K线历史数据（新浪财经）+ MA5 + 买点线，供 ECharts 使用。"""
+    from datetime import date, timedelta
+    from src.stock.services.sina_client import AKShareClient
+    end = date.today().strftime("%Y-%m-%d")
+    start = (date.today() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
+    try:
+        client = AKShareClient()
+        data = client.get_daily_batch([code], start, end)
+        bars = data.get(code, [])
+        if not bars:
+            return {"dates": [], "ohlcv": [], "ma5": [], "ma5x": []}
+        bars = bars[-days:]
+        closes = [b["close"] for b in bars]
+        ma5_vals = []
+        for i in range(len(closes)):
+            if i < 4 or closes[i] is None:
+                ma5_vals.append(None)
+            else:
+                window = [c for c in closes[i-4:i+1] if c is not None]
+                ma5_vals.append(round(sum(window)/len(window), 2) if window else None)
+        return {
+            "dates": [b["date"] for b in bars],
+            "ohlcv": [[b["open"], b["close"], b["low"], b["high"],
+                       round((b["volume"] or 0)/10000, 1),
+                       round(b["change_ratio"] or 0, 2)]
+                      for b in bars],
+            "ma5": ma5_vals,
+            "ma5x": [round(v*1.025, 2) if v else None for v in ma5_vals],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/stock/intraday/{code}")
+async def stock_intraday(code: str):
+    """今日分时数据（1分钟K线，新浪财经）。"""
+    from src.stock.services.sina_client import AKShareClient
+    try:
+        client = AKShareClient()
+        bars = client.get_intraday(code)
+        if not bars:
+            return {"times": [], "prices": [], "volumes": []}
+        return {
+            "times":   [b["time"] for b in bars],
+            "prices":  [b["close"] for b in bars],
+            "volumes": [round((b["volume"] or 0)/10000, 1) for b in bars],
+            "opens":   [b["open"] for b in bars],
+            "highs":   [b["high"] for b in bars],
+            "lows":    [b["low"] for b in bars],
+        }
+    except Exception as e:
+        return {"times": [], "prices": [], "volumes": [], "error": str(e)}
+
+
+@app.get("/api/stock/intraday_old/{code}")
+async def stock_intraday_old(code: str):
+    """备用：东方财富分时（兼容用）"""
+    import akshare as ak
+    symbol = code.split(".")[0]
+    try:
+        df = ak.stock_zh_a_minute(symbol=symbol, period="1", adjust="qfq")
+        if df is None or df.empty:
+            return {"times": [], "prices": [], "volumes": []}
+        df.columns = [c.lower().replace(" ","_") for c in df.columns]
+        date_col = [c for c in df.columns if "time" in c or "日期" in c or "date" in c][0]
+        df[date_col] = df[date_col].astype(str)
+        times = [t[11:16] if len(t) > 10 else t for t in df[date_col].tolist()]
+        closes = [float(v) for v in df["close"].tolist()]
+        vols = [round(float(v)/10000, 1) for v in df["volume"].tolist()]
+        opens = [float(v) for v in df["open"].tolist()]
+        highs = [float(v) for v in df["high"].tolist()]
+        lows = [float(v) for v in df["low"].tolist()]
+        return {"times": times, "prices": closes, "volumes": vols,
+                "opens": opens, "highs": highs, "lows": lows}
+    except Exception as e:
+        return {"times": [], "prices": [], "volumes": [], "error": str(e)}
+
+
+# ── AI 代理接口（用户隔离）────────────────────────────────────────────────────
+
+@app.post("/api/stock/ai/session")
+async def stock_ai_create_session(request: Request):
+    """为当前用户创建 AI 会话，记录 user_id 映射，使用用户专属记忆目录。"""
+    user = _stock_current_user(request)
+    uid = user["uid"]
+    uname = user["u"]
+
+    # 用户专属记忆目录
+    from pathlib import Path as _Path
+    user_memory_dir = _Path.home() / ".vibe-trading" / "memory" / f"user_{uid}"
+    user_memory_dir.mkdir(parents=True, exist_ok=True)
+
+    svc = _get_session_service()
+    if not svc:
+        raise HTTPException(status_code=501, detail="Session runtime not enabled")
+
+    # 创建 session 时注入用户记忆路径（通过环境变量临时设置）
+    import os as _os
+    _os.environ["VIBE_USER_MEMORY_DIR"] = str(user_memory_dir)
+    _os.environ["VIBE_CURRENT_USER"] = uname
+    session = svc.create_session()
+    _os.environ.pop("VIBE_USER_MEMORY_DIR", None)
+
+    from src.stock.stock_db import _conn
+    import time as _t
+    conn = _conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO user_session (user_id, session_id, title, created_at) VALUES (?,?,?,?)",
+        (uid, session.session_id, f"{uname}的对话", _t.strftime("%Y-%m-%d %H:%M:%S"))
+    )
+    conn.commit()
+    return {"session_id": session.session_id}
+
+
+@app.get("/api/stock/ai/sessions")
+async def stock_ai_list_sessions(request: Request):
+    """列出当前用户的 AI 会话。"""
+    user = _stock_current_user(request)
+    svc = _get_session_service()
+    from src.stock.stock_db import _conn
+    rows = _conn().execute(
+        "SELECT session_id, title, created_at FROM user_session WHERE user_id=? ORDER BY id DESC LIMIT 20",
+        (user["uid"],)
+    ).fetchall()
+    if not svc:
+        return [dict(r) for r in rows]
+    # 补充实时状态
+    result = []
+    for row in rows:
+        sid = row["session_id"]
+        s = svc.get_session(sid)
+        result.append({
+            "session_id": sid,
+            "title": s.title if s else row["title"],
+            "status": s.status.value if s else "unknown",
+            "created_at": row["created_at"],
+        })
+    return result
+
+
+@app.post("/api/stock/ai/sessions/{session_id}/messages")
+async def stock_ai_send_message(session_id: str, request: Request):
+    """向指定会话发送消息（验证所属用户）。"""
+    user = _stock_current_user(request)
+    _validate_path_param(session_id, "session_id")
+    from src.stock.stock_db import _conn
+    owns = _conn().execute(
+        "SELECT id FROM user_session WHERE user_id=? AND session_id=?",
+        (user["uid"], session_id)
+    ).fetchone()
+    if not owns:
+        raise HTTPException(status_code=403, detail="会话不属于当前用户")
+    # 转发到原有消息接口
+    body = await request.json()
+    svc = _get_session_service()
+    if not svc:
+        raise HTTPException(status_code=501)
+    session = svc.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404)
+    content = body.get("content", "")
+    await svc.send_message(session_id, content)
+    return {"status": "ok", "session_id": session_id}
+
+
+@app.get("/api/stock/ai/sessions/{session_id}/events")
+async def stock_ai_events(session_id: str, request: Request, token: Optional[str] = None):
+    """SSE 事件流（支持 URL token 参数，EventSource 无法设置 header）。"""
+    # EventSource 不支持自定义 header，允许通过 ?token= 传递
+    if token:
+        from src.stock.user_db import verify_token as _vt
+        payload = _vt(token)
+        if not payload:
+            raise HTTPException(status_code=401, detail="token 无效")
+        user = payload
+    else:
+        user = _stock_current_user(request)
+    _validate_path_param(session_id, "session_id")
+    from src.stock.stock_db import _conn
+    owns = _conn().execute(
+        "SELECT id FROM user_session WHERE user_id=? AND session_id=?",
+        (user["uid"], session_id)
+    ).fetchone()
+    if not owns:
+        raise HTTPException(status_code=403, detail="会话不属于当前用户")
+    svc = _get_session_service()
+    if not svc:
+        raise HTTPException(status_code=501)
+
+    async def event_generator():
+        async for event in svc.event_bus.subscribe(session_id, last_event_id=None):
+            if await request.is_disconnected():
+                break
+            yield event.to_sse()
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/stock/runs")
+async def stock_list_runs(request: Request, limit: int = Query(20, ge=1, le=100)):
+    """列出当前用户的回测记录。"""
+    user = _stock_current_user(request)
+    from src.stock.stock_db import _conn
+    rows = _conn().execute(
+        "SELECT run_id FROM user_run WHERE user_id=? ORDER BY id DESC LIMIT ?",
+        (user["uid"], limit)
+    ).fetchall()
+    run_ids = {r["run_id"] for r in rows}
+    if not run_ids:
+        return []
+    # 从文件系统读取这些 run 的摘要
+    results = []
+    for run_id in run_ids:
+        run_dir = RUNS_DIR / run_id
+        if not run_dir.exists():
+            continue
+        state = _load_json_file(run_dir / "state.json") or {}
+        metrics_file = run_dir / "artifacts" / "metrics.csv"
+        results.append({
+            "run_id": run_id,
+            "status": state.get("status", "unknown"),
+            "prompt": state.get("prompt", "")[:80],
+            "created_at": state.get("created_at", ""),
+            "has_metrics": metrics_file.exists(),
+        })
+    return sorted(results, key=lambda x: x.get("created_at",""), reverse=True)
+
+
+@app.get("/api/stock/breaks")
+async def stock_get_breaks(request: Request):
+    """获取当前断板监控记录。"""
+    user = _stock_current_user(request)
+    from src.stock.services.break_board import get_active_breaks
+    from src.stock.stock_db import _conn
+    return get_active_breaks(_conn(), user["uid"])
+
+
+@app.get("/api/stock/sell-alerts")
+async def stock_sell_alerts(request: Request):
+    """获取当前持仓的卖点提醒状态。"""
+    user = _stock_current_user(request)
+    from src.stock.services.sell_signal import get_sell_alerts
+    from src.stock.stock_db import _conn
+    return get_sell_alerts(_conn(), user["uid"])
+
+
+@app.post("/api/stock/admin/trigger-scan")
+async def stock_trigger_scan(request: Request):
+    """管理员手动触发收盘后任务（测试用）。"""
+    _require_admin(request)
+    from src.stock.services.scheduler import manual_trigger_after_market
+    return manual_trigger_after_market()
+
+
+class AddPositionBody(BaseModel):
+    code: str
+    name: str = ""
+    buy_date: str
+    buy_price: float
+    shares: int = 100
+
+
+@app.post("/api/stock/positions")
+async def stock_add_position(body: AddPositionBody, request: Request):
+    """手动录入持仓。"""
+    user = _stock_current_user(request)
+    from src.stock.stock_db import _conn
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO position (user_id,code,name,buy_date,buy_price,shares,status) VALUES (?,?,?,?,?,?,'open')",
+        (user["uid"], body.code.upper(), body.name, body.buy_date, body.buy_price, body.shares)
+    )
+    conn.commit()
+    return {"status": "ok"}
+
+
+@app.put("/api/stock/positions/{pos_id}/close")
+async def stock_close_position(pos_id: int, request: Request):
+    """平仓。"""
+    user = _stock_current_user(request)
+    body = await request.json()
+    close_price = float(body.get("close_price", 0))
+    from src.stock.stock_db import _conn
+    import time as _time
+    conn = _conn()
+    pos = conn.execute("SELECT * FROM position WHERE id=? AND user_id=?",
+                       (pos_id, user["uid"])).fetchone()
+    if not pos:
+        raise HTTPException(status_code=404, detail="持仓不存在")
+    buy_price = float(pos["buy_price"])
+    shares = int(pos["shares"])
+    pnl = round((close_price - buy_price) * shares, 2)
+    pnl_pct = round((close_price - buy_price) / buy_price * 100, 2) if buy_price else 0
+    today = _time.strftime("%Y-%m-%d")
+    conn.execute(
+        "UPDATE position SET status='closed',close_date=?,close_price=?,pnl=?,pnl_pct=? WHERE id=?",
+        (today, close_price, pnl, pnl_pct, pos_id)
+    )
+    conn.commit()
+    return {"status": "ok", "pnl": pnl, "pnl_pct": pnl_pct}
+
+
+_spot_cache: dict = {"df": None, "ts": 0.0}
+_SPOT_TTL = 30  # 30秒缓存
+
+def _get_spot_df():
+    """获取全市场行情（新浪财经），30秒内复用缓存。"""
+    import akshare as ak, time as _t
+    now = _t.time()
+    if _spot_cache["df"] is not None and now - _spot_cache["ts"] < _SPOT_TTL:
+        return _spot_cache["df"]
+    # 优先新浪（稳定），东方财富备用
+    try:
+        df = ak.stock_zh_a_spot()   # 新浪
+        _spot_cache["df"] = df
+        _spot_cache["ts"] = now
+        _spot_cache["source"] = "sina"
+        return df
+    except Exception:
+        df = ak.stock_zh_a_spot_em()  # 备用：东方财富
+        _spot_cache["df"] = df
+        _spot_cache["ts"] = now
+        _spot_cache["source"] = "em"
+        return df
+
+
+def _row_to_rt(code: str, r) -> dict:
+    """统一行情 dict（兼容新浪和东方财富列名）。"""
+    source = _spot_cache.get("source", "em")
+    if source == "sina":
+        # 新浪列顺序：0=symbol,1=name,2=trade,3=pricechange,4=changepercent,
+        #              5=buy,6=sell,7=settlement(昨收),8=open,9=high,10=low,11=volume,12=amount
+        def _fi(idx, default=0.0):
+            try: return float(r.iloc[idx] or default)
+            except: return default
+        return {
+            "code": code,
+            "name": str(r.iloc[1]),
+            "price": _fi(2),
+            "change_pct": _fi(4),
+            "open": _fi(8),
+            "high": _fi(9),
+            "low": _fi(10),
+            "pre_close": _fi(7),
+            "volume": _fi(11),
+            "amount": _fi(12),
+        }
+    else:
+        def _f(col, default=0.0):
+            try: return float(r.get(col, default) or default)
+            except: return default
+        return {
+            "code": code,
+            "name": str(r.get("名称", "")),
+            "price": _f("最新价"),
+            "change_pct": _f("涨跌幅"),
+            "open": _f("今开"),
+            "high": _f("最高"),
+            "low": _f("最低"),
+            "pre_close": _f("昨收"),
+            "volume": _f("成交量"),
+            "amount": _f("成交额"),
+        }
+
+
+@app.get("/api/stock/realtime/{code}")
+async def stock_realtime(code: str, request: Request):
+    """单只股票实时行情。
+    优先读 realtime_cache（只有入池股票才有缓存）。
+    入池股票缓存无数据时按需拉取一次并写入缓存。
+    未入池股票直接返回空，防止随意拉取。
+    """
+    from src.stock.stock_db import _conn
+    from src.stock.services.realtime_service import (
+        get_from_cache, detect_market, pull_realtime_for_pool, get_pool_codes
+    )
+    conn = _conn()
+
+    # 检查是否在任意用户的策略池中
+    in_pool = conn.execute(
+        "SELECT 1 FROM stock_pool WHERE code=? AND status='in' LIMIT 1", (code,)
+    ).fetchone()
+
+    if not in_pool:
+        return {}  # 未入池不拉取
+
+    # 优先读缓存
+    cached = get_from_cache(conn, code)
+    if cached:
+        return cached
+
+    # 缓存无数据（非交易时段或首次）：按需拉取这只股票
+    symbol = code.split(".")[0]
+    try:
+        df = _get_spot_df()
+        row = df[df["代码"] == symbol]
+        if row.empty:
+            return {}
+        r = row.iloc[0]
+        rt = _row_to_rt(code, r)
+        # 写入缓存
+        from datetime import datetime as _dt
+        conn.execute("""
+            INSERT OR REPLACE INTO realtime_cache
+            (code,name,price,change_pct,open_price,high,low,pre_close,volume,amount,market,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (code, rt["name"], rt["price"], rt["change_pct"],
+              rt["open"], rt["high"], rt["low"], rt["pre_close"],
+              rt["volume"], rt["amount"],
+              detect_market(code), _dt.now().strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit()
+        rt["market"] = detect_market(code)
+        return rt
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/stock/realtime/batch")
+async def stock_realtime_batch(request: Request):
+    """批量获取多只股票实时行情（共用缓存，速度快）。"""
+    body = await request.json()
+    codes = body.get("codes", [])[:50]
+    try:
+        df = _get_spot_df()
+        result = {}
+        for code in codes:
+            symbol = code.split(".")[0]
+            row = df[df["代码"] == symbol]
+            if not row.empty:
+                result[code] = _row_to_rt(code, row.iloc[0])
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# 根路径由 index.html 中的客户端脚本处理重定向，不在服务端处理
+from fastapi.responses import RedirectResponse
+
+
+# ============================================================================
 # Main Entry Point
 # ============================================================================
 
@@ -1757,8 +2459,8 @@ def serve_main(argv: list[str] | None = None) -> int:
         print("[dev] Frontend: http://localhost:5173")
         print(f"[dev] API: http://localhost:{args.port}")
     elif frontend_dist.exists():
-        if not any(route.path == "/" for route in app.routes):
-            app.mount("/", SPAStaticFiles(directory=str(frontend_dist), html=True), name="frontend")
+        # 永远挂载 SPA，显式 @app.get("/") 优先级高于 mount，不受影响
+        app.mount("/", SPAStaticFiles(directory=str(frontend_dist), html=True), name="frontend")
         print(f"[prod] Frontend served from {frontend_dist}")
     else:
         print(f"[warn] No frontend build found at {frontend_dist}")

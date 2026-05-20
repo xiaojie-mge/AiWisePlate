@@ -178,15 +178,165 @@ def _sync_provider_env() -> None:
         os.environ.setdefault("OPENAI_BASE_URL", base_url)
 
 
+def _build_single_llm(
+    *,
+    provider: str,
+    model_name: str,
+    api_key: str,
+    base_url: str,
+    callbacks: Any = None,
+) -> Any:
+    """Build one ChatOpenAI instance from explicit params."""
+    if ChatOpenAI is None:
+        raise RuntimeError("langchain-openai is not installed")
+    temperature = float(os.getenv("LANGCHAIN_TEMPERATURE", "0.0"))
+    if provider == "minimax" and temperature <= 0.0:
+        temperature = 0.01
+    effort = os.getenv("LANGCHAIN_REASONING_EFFORT", "").strip().lower()
+    return ChatOpenAIWithReasoning(
+        model=model_name,
+        openai_api_key=api_key or "none",
+        openai_api_base=base_url,
+        temperature=temperature,
+        timeout=int(os.getenv("TIMEOUT_SECONDS", "120")),
+        max_retries=0,  # fallback wrapper handles retries across providers
+        callbacks=callbacks,
+        extra_body={"reasoning": {"effort": effort}} if effort else None,
+    )
+
+
+def _load_fallback_chain(callbacks: Any = None) -> list:
+    """Read FALLBACK_N_* env vars and return a list of LLM instances.
+
+    Format in .env:
+        FALLBACK_1_PROVIDER=deepseek
+        FALLBACK_1_MODEL=deepseek-chat
+        FALLBACK_1_API_KEY=sk-xxx
+        FALLBACK_1_BASE_URL=https://api.deepseek.com/v1
+    """
+    _ensure_dotenv()
+    chain = []
+    for i in range(1, 10):
+        provider = os.getenv(f"FALLBACK_{i}_PROVIDER", "").strip()
+        model = os.getenv(f"FALLBACK_{i}_MODEL", "").strip()
+        key = os.getenv(f"FALLBACK_{i}_API_KEY", "").strip()
+        url = os.getenv(f"FALLBACK_{i}_BASE_URL", "").strip()
+        if not provider or not model:
+            break
+        try:
+            llm = _build_single_llm(
+                provider=provider, model_name=model,
+                api_key=key, base_url=url, callbacks=callbacks,
+            )
+            chain.append((f"{provider}/{model}", llm))
+        except Exception:
+            pass
+    return chain
+
+
+class FallbackLLM:
+    """Wraps a primary LLM with an ordered fallback chain.
+
+    Transparently proxies invoke/stream/ainvoke/astream.
+    Falls back to the next provider on 5xx / connection errors.
+    """
+
+    _FALLBACK_CODES = {500, 502, 503, 504}
+
+    def __init__(self, primary_name: str, primary: Any, fallbacks: list) -> None:
+        self._primary_name = primary_name
+        self._chain = [(primary_name, primary)] + fallbacks
+        # Expose attributes expected by LangChain / agent loop
+        self.model_name = getattr(primary, "model_name", primary_name)
+        self.callbacks = getattr(primary, "callbacks", None)
+
+    def _should_fallback(self, exc: Exception) -> bool:
+        code = getattr(getattr(exc, "response", None), "status_code", None) \
+               or getattr(exc, "status_code", None)
+        if code in self._FALLBACK_CODES:
+            return True
+        msg = str(exc).lower()
+        return any(k in msg for k in ("upstream", "connection", "timeout", "502", "503", "504"))
+
+    def _try_chain(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        import logging
+        log = logging.getLogger(__name__)
+        last_exc: Exception = RuntimeError("no providers configured")
+        for name, llm in self._chain:
+            try:
+                return getattr(llm, method)(*args, **kwargs)
+            except Exception as exc:
+                if self._should_fallback(exc):
+                    log.warning("Provider %s failed (%s), trying next…", name, exc)
+                    last_exc = exc
+                else:
+                    raise
+        raise last_exc
+
+    def invoke(self, *args: Any, **kwargs: Any) -> Any:
+        return self._try_chain("invoke", *args, **kwargs)
+
+    def stream(self, *args: Any, **kwargs: Any) -> Any:
+        return self._try_chain("stream", *args, **kwargs)
+
+    async def ainvoke(self, *args: Any, **kwargs: Any) -> Any:
+        import logging
+        log = logging.getLogger(__name__)
+        last_exc: Exception = RuntimeError("no providers configured")
+        for name, llm in self._chain:
+            try:
+                return await llm.ainvoke(*args, **kwargs)
+            except Exception as exc:
+                if self._should_fallback(exc):
+                    log.warning("Provider %s failed (%s), trying next…", name, exc)
+                    last_exc = exc
+                else:
+                    raise
+        raise last_exc
+
+    async def astream(self, *args: Any, **kwargs: Any):
+        import logging
+        log = logging.getLogger(__name__)
+        last_exc: Exception = RuntimeError("no providers configured")
+        for name, llm in self._chain:
+            try:
+                async for chunk in llm.astream(*args, **kwargs):
+                    yield chunk
+                return
+            except Exception as exc:
+                if self._should_fallback(exc):
+                    log.warning("Provider %s failed (%s), trying next…", name, exc)
+                    last_exc = exc
+                else:
+                    raise
+        raise last_exc
+
+    def bind_tools(self, *args: Any, **kwargs: Any) -> "FallbackLLM":
+        bound_chain = [(n, llm.bind_tools(*args, **kwargs)) for n, llm in self._chain]
+        obj = FallbackLLM.__new__(FallbackLLM)
+        obj._primary_name = self._primary_name
+        obj._chain = bound_chain
+        obj.model_name = self.model_name
+        obj.callbacks = self.callbacks
+        return obj
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._chain[0][1], name)
+
+
 def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any:
-    """Construct a ChatOpenAI instance.
+    """Construct an LLM instance with optional fallback chain.
+
+    Primary provider is read from LANGCHAIN_PROVIDER / LANGCHAIN_MODEL_NAME.
+    Additional fallbacks are read from FALLBACK_N_PROVIDER / FALLBACK_N_MODEL /
+    FALLBACK_N_API_KEY / FALLBACK_N_BASE_URL (N = 1, 2, 3, …).
 
     Args:
-        model_name: Model name; defaults to LANGCHAIN_MODEL_NAME.
+        model_name: Model name override; defaults to LANGCHAIN_MODEL_NAME.
         callbacks: Optional LangChain callbacks.
 
     Returns:
-        ChatOpenAI instance.
+        FallbackLLM wrapping one or more ChatOpenAI instances.
 
     Raises:
         RuntimeError: If langchain-openai is missing or LANGCHAIN_MODEL_NAME is unset.
@@ -210,21 +360,27 @@ def build_llm(*, model_name: Optional[str] = None, callbacks: Any = None) -> Any
 
     if ChatOpenAI is None:
         raise RuntimeError("langchain-openai is not installed")
-    # MiniMax requires temperature in (0.0, 1.0] — clamp to 0.01 when the
-    # default 0.0 is used to avoid an API validation error.
     if provider == "minimax" and temperature <= 0.0:
         temperature = 0.01
-    # Optional reasoning activation for relays requiring opt-in (e.g. OpenRouter).
-    # Moonshot/DeepSeek official APIs emit reasoning by default and ignore this field.
     effort = os.getenv("LANGCHAIN_REASONING_EFFORT", "").strip().lower()
-    return ChatOpenAIWithReasoning(
+    # Qwen3 thinking models: disable by default for speed unless explicitly enabled
+    extra: dict = {}
+    if effort:
+        extra["reasoning"] = {"effort": effort}
+    if provider in {"dashscope", "qwen"} and not effort:
+        extra["enable_thinking"] = False
+    primary = ChatOpenAIWithReasoning(
         model=name,
         temperature=temperature,
         timeout=int(os.getenv("TIMEOUT_SECONDS", "120")),
         max_retries=int(os.getenv("MAX_RETRIES", "2")),
         callbacks=callbacks,
-        extra_body={"reasoning": {"effort": effort}} if effort else None,
+        extra_body=extra if extra else None,
     )
+    fallbacks = _load_fallback_chain(callbacks=callbacks)
+    if not fallbacks:
+        return primary
+    return FallbackLLM(f"{provider}/{name}", primary, fallbacks)
 
 
 def _extract_balanced_json(text: str) -> Optional[Dict[str, Any]]:

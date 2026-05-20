@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI智慧盘 登录</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:linear-gradient(135deg,#fff7ed 0%,#f8f9fa 100%);
+     min-height:100vh;display:flex;align-items:center;justify-content:center;
+     font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+
+.card{background:#fff;border:1px solid #e5e7eb;border-radius:16px;
+      padding:48px 40px;width:400px;box-shadow:0 24px 64px rgba(0,0,0,.5)}
+
+.logo{text-align:center;margin-bottom:36px}
+.logo-icon{display:flex;align-items:center;justify-content:center;
+           width:56px;height:56px;border-radius:14px;margin:0 auto 14px;
+           background:linear-gradient(135deg,#f97316,#ea580c);font-size:28px}
+.logo-title{font-size:22px;font-weight:800;color:#111827;letter-spacing:-.5px}
+.logo-sub{font-size:13px;color:#6b7280;margin-top:5px}
+
+.form-group{margin-bottom:18px}
+.form-group label{display:block;font-size:13px;color:#374151;font-weight:500;margin-bottom:7px}
+.form-group input{
+  width:100%;padding:12px 14px;border:1.5px solid #e5e7eb;border-radius:8px;
+  font-size:14px;color:#111827;outline:none;transition:.2s;
+  background:#fafafa}
+.form-group input:focus{border-color:#f97316;box-shadow:0 0 0 3px rgba(249,115,22,.1);background:#fff}
+.form-group input::placeholder{color:#9ca3af}
+
+.btn-login{
+  width:100%;padding:13px;
+  background:linear-gradient(135deg,#f97316,#ea580c);
+  color:#fff;border:none;border-radius:8px;
+  font-size:15px;font-weight:600;cursor:pointer;margin-top:8px;
+  transition:.2s;letter-spacing:.3px}
+.btn-login:hover{opacity:.9;transform:translateY(-1px)}
+.btn-login:disabled{opacity:.5;cursor:not-allowed;transform:none}
+
+.error{color:#dc2626;font-size:13px;text-align:center;margin-top:14px;
+       padding:10px;background:#fef2f2;border:1px solid #fecaca;
+       border-radius:8px;display:none}
+
+.footer{text-align:center;margin-top:28px;font-size:12px;color:#9ca3af}
+.footer a{color:#f97316;text-decoration:none}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <div class="logo-icon">📈</div>
+    <div class="logo-title">AI智慧盘</div>
+    <div class="logo-sub">AiWisePlate · 智能股票分析与量化研究平台</div>
+  </div>
+
+  <form onsubmit="doLogin(event)">
+    <div class="form-group">
+      <label>账号</label>
+      <input id="username" type="text" placeholder="请输入账号" autocomplete="username" required>
+    </div>
+    <div class="form-group">
+      <label>密码</label>
+      <input id="password" type="password" placeholder="请输入密码" autocomplete="current-password" required>
+    </div>
+    <button class="btn-login" id="login-btn" type="submit">登 录</button>
+  </form>
+
+  <div class="error" id="error-msg"></div>
+
+  <div class="footer">AI智慧盘 &copy; 2026</div>
+</div>
+
+<script>
+async function doLogin(e) {
+  e.preventDefault()
+  const btn  = document.getElementById('login-btn')
+  const err  = document.getElementById('error-msg')
+  const user = document.getElementById('username').value.trim()
+  const pass = document.getElementById('password').value
+
+  btn.disabled = true; btn.textContent = '登录中...'
+  err.style.display = 'none'
+
+  try {
+    const r = await fetch('/api/stock/auth/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username: user, password: pass}),
+    })
+    const data = await r.json()
+    if (!r.ok) {
+      err.textContent = data.detail || '账号或密码错误'
+      err.style.display = 'block'
+      return
+    }
+    localStorage.setItem('vt_token', data.token)
+    localStorage.setItem('vt_user', data.username)
+    localStorage.setItem('vt_role', data.role)
+    localStorage.setItem('vt_display', data.display)
+    const next = new URLSearchParams(location.search).get('next') || '/'
+    window.location.href = next
+  } catch {
+    err.textContent = '无法连接到服务器'
+    err.style.display = 'block'
+  } finally {
+    btn.disabled = false; btn.textContent = '登 录'
+  }
+}
+
+// 已登录跳转
+if (localStorage.getItem('vt_token')) {
+  window.location.href = new URLSearchParams(location.search).get('next') || '/'
+}
+</script>
+</body>
+</html>

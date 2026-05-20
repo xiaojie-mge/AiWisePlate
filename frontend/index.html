@@ -3,7 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Vibe-Trading — vibe trading with your professional financial agent team</title>
+    <script>
+      if (!localStorage.getItem('vt_token')) {
+        // 未登录 → 跳登录页
+        window.location.replace('/login?next=' + encodeURIComponent(location.pathname + location.search));
+      } else if (location.pathname === '/') {
+        // 已登录访问根路径 → 跳股票监控
+        window.location.replace('/stock');
+      }
+    </script>
+    <title>AI智慧盘 · AiWisePlate — 智能股票分析与量化研究平台</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>

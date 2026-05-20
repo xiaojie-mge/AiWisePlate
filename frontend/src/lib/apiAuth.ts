@@ -1,7 +1,10 @@
 const STORAGE_KEY = "vibe_trading_api_auth_key";
 
 export function getApiAuthKey(): string {
-  return window.localStorage.getItem(STORAGE_KEY) || "";
+  // 优先用手动设置的 API Key，其次自动用股票登录的 vt_token
+  return window.localStorage.getItem(STORAGE_KEY)
+    || window.localStorage.getItem("vt_token")
+    || "";
 }
 
 export function setApiAuthKey(value: string): void {

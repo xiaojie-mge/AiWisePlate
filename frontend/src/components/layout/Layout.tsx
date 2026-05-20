@@ -1,6 +1,6 @@
 ﻿import { useEffect, useState } from "react";
 import { Link, Outlet, useLocation, useSearchParams } from "react-router-dom";
-import { BarChart3, Bot, Moon, Sun, Plus, Trash2, Pencil, MessageSquare, ChevronsLeft, ChevronsRight, Settings } from "lucide-react";
+import { BarChart3, Bot, Moon, Sun, Plus, Trash2, Pencil, MessageSquare, ChevronsLeft, ChevronsRight, Settings, TrendingUp, LogOut } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useI18n } from "@/lib/i18n";
 import { useDarkMode } from "@/hooks/useDarkMode";
@@ -15,10 +15,22 @@ const NAV = [
   { to: "/correlation", icon: BarChart3, key: "correlation" as const },
 ];
 
+function logout() {
+  ['vt_token','vt_user','vt_role','vt_display'].forEach(k => localStorage.removeItem(k));
+  window.location.href = '/login';
+}
+
 export function Layout() {
   const { pathname } = useLocation();
   const [searchParams] = useSearchParams();
-  const { t } = useI18n();
+  const vtDisplay = localStorage.getItem('vt_display') || localStorage.getItem('vt_user') || '';
+  const { t, lang, toggleLang } = useI18n();
+
+  useEffect(() => {
+    document.title = lang === "zh"
+      ? "AI智慧盘 · AiWisePlate — 智能股票分析与量化研究平台"
+      : "AiWisePlate — Smart Stock Analysis & Quant Research";
+  }, [lang]);
   const { dark, toggle } = useDarkMode();
   const [sessions, setSessions] = useState<SessionItem[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(true);
@@ -203,6 +215,9 @@ export function Layout() {
               <button onClick={toggle} className="p-1.5 text-muted-foreground hover:text-foreground rounded transition-colors" title={dark ? t.lightMode : t.darkMode}>
                 {dark ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
               </button>
+              <button onClick={toggleLang} className="p-1.5 text-muted-foreground hover:text-foreground rounded transition-colors text-[10px] font-medium" title={t.language}>
+                {t.language === "中文" ? "中" : "EN"}
+              </button>
               <button onClick={() => setCollapsed(false)} className="p-1.5 text-muted-foreground hover:text-foreground rounded transition-colors" title="Expand">
                 <ChevronsRight className="h-3.5 w-3.5" />
               </button>
@@ -210,13 +225,39 @@ export function Layout() {
           ) : (
             <>
               <div className="flex items-center justify-between">
-                <button
-                  onClick={toggle}
-                  className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                {vtDisplay && (
+                  <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-1">
+                    <div className="w-5 h-5 rounded-full bg-primary/80 flex items-center justify-center text-[10px] text-white font-bold shrink-0">
+                      {vtDisplay[0]?.toUpperCase()}
+                    </div>
+                    <span className="truncate">{vtDisplay}</span>
+                    <button onClick={logout} className="ml-auto p-0.5 hover:text-destructive transition-colors" title="退出登录">
+                      <LogOut className="h-3 w-3" />
+                    </button>
+                  </div>
+                )}
+                <a
+                  href="/stock"
+                  className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors mb-1"
                 >
-                  {dark ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
-                  {dark ? t.lightMode : t.darkMode}
-                </button>
+                  <TrendingUp className="h-3.5 w-3.5" />
+                  股票监控
+                </a>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={toggle}
+                    className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                  >
+                    {dark ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
+                    {dark ? t.lightMode : t.darkMode}
+                  </button>
+                  <button
+                    onClick={toggleLang}
+                    className="text-xs text-muted-foreground hover:text-foreground transition-colors font-medium"
+                  >
+                    {t.language}
+                  </button>
+                </div>
                 <div className="flex items-center gap-1">
                   <button
                     onClick={() => setCollapsed(true)}

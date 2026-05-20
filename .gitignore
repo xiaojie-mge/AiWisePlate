@@ -71,3 +71,21 @@ NOTES.md
 
 # Agent tool aliases (auto-generated mirror of CLAUDE.md)
 AGENTS.md
+
+# AiWisePlate - 排除第三方代码示例（版权归属第三方）
+doc/代码/
+
+# 本地数据库（包含用户数据，不提交）
+agent/stock_users.db
+agent/stock_data.db
+agent/*.db
+
+# 本地静态资源（体积大，部署时自行下载）
+agent/static/echarts.min.js
+
+# 启动脚本（本地环境专用）
+start-vibe-trading.bat
+start-vibe-trading.ps1
+
+# 内存文件（本地会话数据）
+memory/
